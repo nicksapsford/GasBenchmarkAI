@@ -42,7 +42,7 @@ from notifier_gas import (
     notify_system_startup, notify_trade_opened,
     notify_trade_closed_win, notify_trade_closed_loss, notify_system_error,
 )
-from paper_trader_gas import PaperTraderGas
+from paper_trader_gas import PaperTraderGas, TRADES_LOG
 from pre_checks_gas import run_all_pre_checks, run_individual_pre_checks, check_kill_switch_reset
 from strategy_gas import should_force_close, get_gbpusd_rate
 import direction_switch
@@ -79,6 +79,36 @@ def _handle_signal(sig, frame):
 
 signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
+
+
+def _today_realised_pnl(csv_path) -> float:
+    """Sum today's (UTC) realised P&L from the trade-log CSV (Today P&L Persist Fix,
+    30 Jul 2026). Lets a mid-day restart keep the 'today' counter accurate instead of
+    resetting to zero. Only CLOSED trades are in this CSV, so open positions are excluded.
+    Robust: missing file / no trades today / bad rows -> 0.0. All timestamps are UTC."""
+    import csv as _csv
+    from datetime import datetime as _dt, timezone as _tz
+    from pathlib import Path as _Path
+    try:
+        p = _Path(csv_path)
+        if not p.exists():
+            return 0.0
+        today = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+        total = 0.0
+        with p.open(newline="", encoding="utf-8") as fh:
+            for row in _csv.DictReader(fh):
+                d = (row.get("date") or "").strip()
+                if not d:
+                    d = (row.get("entry_time") or "").strip()[:10]
+                if d != today:
+                    continue
+                try:
+                    total += float(row.get("pnl_gbp") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+        return round(total, 2)
+    except Exception:
+        return 0.0
 
 
 class AccountState:
@@ -318,6 +348,11 @@ def main() -> None:
 
     stanley = PaperTraderGas()
     account = AccountState(capital=stanley.capital_gbp)
+    # Today P&L Persist Fix (30 Jul 2026): seed the in-memory daily tally from today's
+    # closed trades so a mid-day restart keeps the 'today' figure instead of resetting to 0.
+    account.daily_pnl_gbp = _today_realised_pnl(TRADES_LOG)
+    if account.daily_pnl_gbp:
+        log.info("Restored today's realised P&L from trade log: GBP %.2f", account.daily_pnl_gbp)
     try:
         notify_system_startup(capital=stanley.capital_gbp, mode="PAPER (Benchmark)")
     except Exception:
